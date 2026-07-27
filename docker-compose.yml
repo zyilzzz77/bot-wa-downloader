@@ -5,7 +5,6 @@ services:
     restart: unless-stopped
     environment:
       - NEOXR_API_KEY=${NEOXR_API_KEY}
-      - PHONE_NUMBER=${PHONE_NUMBER}
       - TZ=Asia/Jakarta
     volumes:
       - ./data:/app/data
