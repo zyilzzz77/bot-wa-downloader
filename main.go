@@ -1,14 +1,13 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"database/sql"
+	"flag"
 	"fmt"
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
 
@@ -78,6 +77,9 @@ func (c *ClientWrapper) EditText(ctx context.Context, jid types.JID, msgID, newT
 // --- Entry Point ---
 
 func main() {
+	pairPhone := flag.String("pair", "", "Pairing dengan nomor HP (contoh: -pair 6281234567890)")
+	flag.Parse()
+
 	ctx := context.Background()
 
 	// Buat direktori data
@@ -88,13 +90,12 @@ func main() {
 	}
 	dbPath := filepath.Join(dataDir, "whatsapp.db")
 
-	// Inisialisasi SQLite store (buka DB manual untuk set PRAGMA)
+	// Inisialisasi SQLite store
 	rawDB, err := sql.Open("sqlite", fmt.Sprintf("file:%s?_journal_mode=WAL&_busy_timeout=5000", dbPath))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Gagal membuka database: %v\n", err)
 		os.Exit(1)
 	}
-	// Enable foreign keys — wajib untuk whatsmeow
 	if _, err := rawDB.Exec("PRAGMA foreign_keys = ON"); err != nil {
 		fmt.Fprintf(os.Stderr, "Gagal enable foreign keys: %v\n", err)
 		os.Exit(1)
@@ -105,18 +106,23 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Ambil device pertama
 	deviceStore, err := container.GetFirstDevice(ctx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Gagal mendapatkan device: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Buat WhatsApp client
 	waClient := whatsmeow.NewClient(deviceStore, waLog.Stdout("wa", "INFO", true))
+
+	// --- Mode: Pairing command ---
+	if *pairPhone != "" {
+		pairAndExit(waClient, *pairPhone)
+		return
+	}
+
+	// --- Mode: Normal bot ---
 	wrapper := &ClientWrapper{Client: waClient}
 
-	// Daftarkan event handler
 	waClient.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
 		case *events.Message:
@@ -129,12 +135,20 @@ func main() {
 	fmt.Println("╚══════════════════════════════════════════════╝")
 	fmt.Println()
 
-	// Autentikasi
 	if waClient.Store.ID == nil {
-		// Belum login — tanya metode pairing
-		connect(waClient)
+		// Belum login — cek PHONE_NUMBER untuk auto-pairing
+		phoneEnv := os.Getenv("PHONE_NUMBER")
+		if phoneEnv == "" {
+			fmt.Fprintln(os.Stderr, "❌ Bot belum login dan PHONE_NUMBER tidak diset.")
+			fmt.Fprintln(os.Stderr, "   Jalankan command pairing:")
+			fmt.Fprintln(os.Stderr, "   docker compose exec botgodownloader ./botgodownloader -pair 628xxx")
+			fmt.Fprintln(os.Stderr, "")
+			fmt.Fprintln(os.Stderr, "   Atau set PHONE_NUMBER di .env untuk auto-pairing.")
+			os.Exit(1)
+		}
+		fmt.Printf("Auto-pairing dengan nomor: %s\n", phoneEnv)
+		loginWithPairingPhone(waClient, phoneEnv)
 	} else {
-		// Sudah login
 		if err := waClient.Connect(); err != nil {
 			fmt.Fprintf(os.Stderr, "Gagal koneksi: %v\n", err)
 			os.Exit(1)
@@ -144,7 +158,6 @@ func main() {
 
 	fmt.Println("Tekan Ctrl+C untuk keluar…")
 
-	// Tunggu sinyal keluar
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	<-sigCh
@@ -154,39 +167,16 @@ func main() {
 	fmt.Println("Bot berhenti.")
 }
 
-// connect menangani proses pairing / login pertama kali.
-func connect(client *whatsmeow.Client) {
-	// Cek PHONE_NUMBER env var untuk headless pairing (VPS)
-	phoneEnv := os.Getenv("PHONE_NUMBER")
-	if phoneEnv != "" {
-		fmt.Printf("Auto-pairing dengan nomor: %s\n", phoneEnv)
-		loginWithPairingPhone(client, phoneEnv)
-		return
-	}
-
-	reader := bufio.NewReader(os.Stdin)
-
-	fmt.Println("Pilih metode login:")
-	fmt.Println("  1. Pairing Code (masukkan nomor HP, dapat kode)")
-	fmt.Println("  2. QR Code (scan dengan WhatsApp)")
-	fmt.Print("Pilihan [1/2]: ")
-
-	choice, _ := reader.ReadString('\n')
-	choice = strings.TrimSpace(choice)
-
-	if choice == "1" {
-		fmt.Print("Masukkan nomor HP (contoh: 6281234567890): ")
-		phone, _ := reader.ReadString('\n')
-		phone = strings.TrimSpace(phone)
-		loginWithPairingPhone(client, phone)
-	} else {
-		loginWithQR(client)
-	}
+// pairAndExit melakukan pairing code lalu keluar (untuk command -pair).
+func pairAndExit(client *whatsmeow.Client, phone string) {
+	fmt.Printf("Pairing code dengan nomor: %s\n", phone)
+	loginWithPairingPhone(client, phone)
+	fmt.Println("Session tersimpan. Restart bot untuk mulai:")
+	fmt.Println("  docker compose restart botgodownloader")
 }
 
 // loginWithPairingPhone melakukan pairing code dengan nomor HP yang diberikan.
 func loginWithPairingPhone(client *whatsmeow.Client, phone string) {
-	// Koneksi harus aktif sebelum PairPhone
 	if err := client.Connect(); err != nil {
 		fmt.Fprintf(os.Stderr, "Gagal koneksi: %v\n", err)
 		os.Exit(1)
@@ -209,41 +199,9 @@ func loginWithPairingPhone(client *whatsmeow.Client, phone string) {
 	fmt.Println("  Masukkan kode di atas.")
 	fmt.Println()
 
-	// Tunggu pairing disetujui di HP
 	fmt.Println("Menunggu pairing disetujui di HP…")
 	for client.Store.ID == nil {
 		time.Sleep(1 * time.Second)
 	}
-	fmt.Println("✓ Pairing berhasil! Bot siap digunakan.")
-}
-
-// loginWithQR menampilkan QR code untuk scan.
-func loginWithQR(client *whatsmeow.Client) {
-	fmt.Println("Menampilkan QR code…")
-
-	qrChan, err := client.GetQRChannel(context.Background())
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Gagal mendapatkan QR channel: %v\n", err)
-		os.Exit(1)
-	}
-
-	if err := client.Connect(); err != nil {
-		fmt.Fprintf(os.Stderr, "Gagal koneksi: %v\n", err)
-		os.Exit(1)
-	}
-
-	for evt := range qrChan {
-		switch evt.Event {
-		case "code":
-			fmt.Println("\n" + evt.Code + "\n")
-		case "success":
-			fmt.Println("✓ Login berhasil!")
-			return
-		case "timeout":
-			fmt.Fprintf(os.Stderr, "QR timeout — jalankan ulang bot.\n")
-			os.Exit(1)
-		default:
-			fmt.Printf("Event: %s\n", evt.Event)
-		}
-	}
+	fmt.Println("✓ Pairing berhasil!")
 }
