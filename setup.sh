@@ -21,6 +21,7 @@ if [ -n "$MISSING" ]; then
 fi
 
 # Generate .env
+install -m 600 /dev/null .env
 cat > .env <<EOF
 NEOXR_API_KEY=$NEOXR_API_KEY
 EOF
