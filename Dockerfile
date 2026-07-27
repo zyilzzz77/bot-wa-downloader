@@ -9,13 +9,11 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o botgodownloader .
 
 FROM alpine:3.22
 
-RUN apk add --no-cache ca-certificates tzdata && \
-    adduser -D -s /bin/false bot
+RUN apk add --no-cache ca-certificates tzdata
 
 WORKDIR /app
 COPY --from=builder /app/botgodownloader .
 
-RUN mkdir -p /app/data && chown -R bot:bot /app
+RUN mkdir -p /app/data
 
-USER bot
 ENTRYPOINT ["./botgodownloader"]
