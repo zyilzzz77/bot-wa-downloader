@@ -1,0 +1,4 @@
+data/
+*.exe
+.env
+deploy.sh
