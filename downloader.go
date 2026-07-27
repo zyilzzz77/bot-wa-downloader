@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"time"
@@ -55,6 +56,46 @@ type DownloadResult struct {
 // httpClient digunakan bersama dengan timeout yang cukup untuk download.
 var httpClient = &http.Client{Timeout: 120 * time.Second}
 
+// --- Retry wrapper ---
+
+const maxRetries = 3
+
+// callAPIWithRetry memanggil API dengan auto-retry (backoff 2s, 4s, 8s).
+// Retry hanya untuk status 5xx (server error).
+func callAPIWithRetry(apiURL, platform string) ([]byte, error) {
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			delay := time.Duration(1<<attempt) * time.Second // 2s, 4s, 8s
+			log.Printf("[%s] Retry %d/%d — menunggu %v...", platform, attempt, maxRetries-1, delay)
+			time.Sleep(delay)
+		}
+
+		resp, err := httpClient.Get(apiURL)
+		if err != nil {
+			lastErr = fmt.Errorf("gagal menghubungi API: %w", err)
+			continue
+		}
+
+		body, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if readErr != nil {
+			lastErr = fmt.Errorf("gagal membaca respons API: %w", readErr)
+			continue
+		}
+
+		// Status 5xx → server error, retry. Status lain → langsung return.
+		if resp.StatusCode >= 500 {
+			lastErr = fmt.Errorf("API %s error %d: %s", platform, resp.StatusCode, string(body))
+			continue
+		}
+
+		return body, nil
+	}
+	return nil, lastErr
+}
+
 // DownloadTikTok mengambil data media TikTok melalui API neoxr.
 func DownloadTikTok(tiktokURL, apiKey string) (*DownloadResult, error) {
 	apiURL := fmt.Sprintf(
@@ -63,19 +104,9 @@ func DownloadTikTok(tiktokURL, apiKey string) (*DownloadResult, error) {
 		apiKey,
 	)
 
-	resp, err := httpClient.Get(apiURL)
+	body, err := callAPIWithRetry(apiURL, "tiktok")
 	if err != nil {
-		return nil, fmt.Errorf("gagal menghubungi API TikTok: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("gagal membaca respons API: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("API TikTok error %d: %s", resp.StatusCode, string(body))
+		return nil, err
 	}
 
 	var apiResp TikTokResponse
@@ -92,17 +123,12 @@ func DownloadTikTok(tiktokURL, apiKey string) (*DownloadResult, error) {
 		Creator:  apiResp.Creator,
 	}
 
-	// Hanya pakai video (tanpa watermark, ukuran lebih kecil)
 	if apiResp.Data.Video != "" {
 		result.Videos = append(result.Videos, apiResp.Data.Video)
 	}
-
-	// Audio (MP3)
 	if apiResp.Data.Audio != "" {
 		result.Audio = append(result.Audio, apiResp.Data.Audio)
 	}
-
-	// Foto (slideshow TikTok)
 	for _, photo := range apiResp.Data.Photo {
 		if photo != "" {
 			result.Images = append(result.Images, photo)
@@ -120,19 +146,9 @@ func DownloadInstagram(igURL, apiKey string) (*DownloadResult, error) {
 		apiKey,
 	)
 
-	resp, err := httpClient.Get(apiURL)
+	body, err := callAPIWithRetry(apiURL, "instagram")
 	if err != nil {
-		return nil, fmt.Errorf("gagal menghubungi API Instagram: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("gagal membaca respons API: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("API Instagram error %d: %s", resp.StatusCode, string(body))
+		return nil, err
 	}
 
 	var apiResp InstagramResponse
@@ -159,7 +175,6 @@ func DownloadInstagram(igURL, apiKey string) (*DownloadResult, error) {
 		case "jpg", "jpeg", "png", "webp", "image":
 			result.Images = append(result.Images, media.URL)
 		default:
-			// Fallback: coba deteksi dari ekstensi URL
 			result.Videos = append(result.Videos, media.URL)
 		}
 	}
