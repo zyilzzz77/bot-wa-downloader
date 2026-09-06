@@ -9,9 +9,9 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
-	"time"
 
 	_ "modernc.org/sqlite"
+	"github.com/mdp/qrterminal/v3"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/store/sqlstore"
@@ -35,9 +35,10 @@ func init() {
 // --- Constanta Media Type ---
 
 const (
-	whatsmeowMediaImage = whatsmeow.MediaImage
-	whatsmeowMediaVideo = whatsmeow.MediaVideo
-	whatsmeowMediaAudio = whatsmeow.MediaAudio
+	whatsmeowMediaImage    = whatsmeow.MediaImage
+	whatsmeowMediaVideo    = whatsmeow.MediaVideo
+	whatsmeowMediaAudio    = whatsmeow.MediaAudio
+	whatsmeowMediaDocument = whatsmeow.MediaDocument
 )
 
 // --- Wrapper WhatsApp Client ---
@@ -77,7 +78,6 @@ func (c *ClientWrapper) EditText(ctx context.Context, jid types.JID, msgID, newT
 // --- Entry Point ---
 
 func main() {
-	pairPhone := flag.String("pair", "", "Pairing dengan nomor HP (contoh: -pair 6281234567890)")
 	flag.Parse()
 
 	ctx := context.Background()
@@ -114,12 +114,6 @@ func main() {
 
 	waClient := whatsmeow.NewClient(deviceStore, waLog.Stdout("wa", "INFO", true))
 
-	// --- Mode: Pairing command ---
-	if *pairPhone != "" {
-		pairAndExit(waClient, *pairPhone)
-		return
-	}
-
 	// --- Mode: Normal bot ---
 	wrapper := &ClientWrapper{Client: waClient}
 
@@ -131,23 +125,28 @@ func main() {
 	})
 
 	fmt.Println("╔══════════════════════════════════════════════╗")
-	fmt.Println("║   BOT WA DOWNLOADER TIKTOK & INSTAGRAM      ║")
+	fmt.Println("║ BOT WA DOWNLOADER TT, IG, TERABOX & THREADS ║")
 	fmt.Println("╚══════════════════════════════════════════════╝")
 	fmt.Println()
 
 	if waClient.Store.ID == nil {
-		// Belum login — cek PHONE_NUMBER untuk auto-pairing
-		phoneEnv := os.Getenv("PHONE_NUMBER")
-		if phoneEnv == "" {
-			fmt.Fprintln(os.Stderr, "❌ Bot belum login dan PHONE_NUMBER tidak diset.")
-			fmt.Fprintln(os.Stderr, "   Jalankan command pairing:")
-			fmt.Fprintln(os.Stderr, "   docker compose exec botgodownloader ./botgodownloader -pair 628xxx")
-			fmt.Fprintln(os.Stderr, "")
-			fmt.Fprintln(os.Stderr, "   Atau set PHONE_NUMBER di .env untuk auto-pairing.")
+		fmt.Println("Belum login — scan QR di bawah pakai HP bot:")
+		fmt.Println("  WhatsApp → Pengaturan / Perangkat Tertaut → Tautkan Perangkat")
+		fmt.Println()
+		qrChan, _ := waClient.GetQRChannel(ctx)
+		if err := waClient.Connect(); err != nil {
+			fmt.Fprintf(os.Stderr, "Gagal koneksi: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("Auto-pairing dengan nomor: %s\n", phoneEnv)
-		loginWithPairingPhone(waClient, phoneEnv)
+		for evt := range qrChan {
+			if evt.Event == "code" {
+				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+				fmt.Println()
+			} else {
+				fmt.Printf("QR: %s\n", evt.Event)
+			}
+		}
+		fmt.Println("✓ Login QR berhasil!")
 	} else {
 		if err := waClient.Connect(); err != nil {
 			fmt.Fprintf(os.Stderr, "Gagal koneksi: %v\n", err)
@@ -165,43 +164,4 @@ func main() {
 	fmt.Println("\nMematikan bot…")
 	waClient.Disconnect()
 	fmt.Println("Bot berhenti.")
-}
-
-// pairAndExit melakukan pairing code lalu keluar (untuk command -pair).
-func pairAndExit(client *whatsmeow.Client, phone string) {
-	fmt.Printf("Pairing code dengan nomor: %s\n", phone)
-	loginWithPairingPhone(client, phone)
-	fmt.Println("Session tersimpan. Restart bot untuk mulai:")
-	fmt.Println("  docker compose restart botgodownloader")
-}
-
-// loginWithPairingPhone melakukan pairing code dengan nomor HP yang diberikan.
-func loginWithPairingPhone(client *whatsmeow.Client, phone string) {
-	if err := client.Connect(); err != nil {
-		fmt.Fprintf(os.Stderr, "Gagal koneksi: %v\n", err)
-		os.Exit(1)
-	}
-
-	ctx := context.Background()
-	code, err := client.PairPhone(ctx, phone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Gagal pairing: %v\n", err)
-		os.Exit(1)
-	}
-
-	fmt.Println()
-	fmt.Println("╔══════════════════════════════════╗")
-	fmt.Printf("║   KODE PAIRING: %-16s  ║\n", code)
-	fmt.Println("╚══════════════════════════════════╝")
-	fmt.Println()
-	fmt.Println("Buka WhatsApp di HP:")
-	fmt.Println("  Perangkat Tertaut → Tautkan Perangkat → Tautkan dengan Nomor Telepon")
-	fmt.Println("  Masukkan kode di atas.")
-	fmt.Println()
-
-	fmt.Println("Menunggu pairing disetujui di HP…")
-	for client.Store.ID == nil {
-		time.Sleep(1 * time.Second)
-	}
-	fmt.Println("✓ Pairing berhasil!")
 }
