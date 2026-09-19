@@ -36,6 +36,19 @@ var (
 	threadsRegex = regexp.MustCompile(
 		`https?://(?:www\.)?threads\.(?:com|net)/(?:@[\w.-]+/post/[\w-]+|share/[\w-]+/?|@[\w.-]+/[\w-]+/?)`,
 	)
+
+	// YouTube: watch, short link (youtu.be), shorts, live, dan embed.
+	youtubeRegex = regexp.MustCompile(
+		`https?://(?:www\.|m\.|music\.)?(?:youtube\.com/(?:watch\?v=[\w-]+|shorts/[\w-]+|live/[\w-]+|embed/[\w-]+)|youtu\.be/[\w-]+)`,
+	)
+
+	// Google Drive: file (/file/d/ID), open?id=, uc?id=, dan folder (/drive/folders/ID).
+	gdriveRegex = regexp.MustCompile(
+		`https?://drive\.google\.com/(?:file/d/[\w-]+|open\?id=[\w-]+|uc\?(?:export=download&)?id=[\w-]+|drive/folders/[\w-]+)`,
+	)
+
+	// Folder Google Drive — belum didukung, dipakai untuk memberi pesan yang jelas.
+	gdriveFolderRegex = regexp.MustCompile(`https?://drive\.google\.com/drive/folders/[\w-]+`)
 )
 
 // detectURL memeriksa teks dan mengembalikan platform serta URL pertama yang ditemukan.
@@ -51,6 +64,12 @@ func detectURL(text string) (platform, rawURL string) {
 	}
 	if m := threadsRegex.FindString(text); m != "" {
 		return "threads", strings.TrimRight(m, "/")
+	}
+	if m := youtubeRegex.FindString(text); m != "" {
+		return "youtube", strings.TrimRight(m, "/")
+	}
+	if m := gdriveRegex.FindString(text); m != "" {
+		return "gdrive", strings.TrimRight(m, "/")
 	}
 	return "", ""
 }
@@ -80,8 +99,24 @@ func handleMessage(client *ClientWrapper, evt *events.Message) {
 		return
 	}
 
+	if cmd, ok := parseYouTubeCommand(text); ok {
+		handleYouTube(client, evt.Info.Chat, cmd.url, cmd.mediaType, cmd.quality)
+		return
+	}
+
 	platform, detectedURL := detectURL(text)
 	if detectedURL == "" {
+		return
+	}
+
+	// YouTube & Google Drive punya alur sendiri, bukan media per-URL.
+	switch platform {
+	case "youtube":
+		// Link YouTube tanpa command → unduh video kualitas default.
+		handleYouTube(client, evt.Info.Chat, detectedURL, youTubeTypeVideo, youTubeDefaultVideo)
+		return
+	case "gdrive":
+		handleGDrive(client, evt.Info.Chat, detectedURL)
 		return
 	}
 
@@ -189,6 +224,141 @@ func handlePlayCommand(client *ClientWrapper, chatJID types.JID, query string) {
 	log.Printf("[play] Download audio sukses — %.1fMB, upload ke WA...", float64(len(data))/(1024*1024))
 	uploadAndSendAudio(client, ctx, chatJID, data, "audio/mpeg")
 	log.Printf("[play] ✓ Audio terkirim!")
+}
+
+// --- Command /yt & /ytmp3 (unduh video / audio YouTube) ---
+
+// youTubeCommand adalah hasil parsing command unduh YouTube.
+type youTubeCommand struct {
+	url       string
+	mediaType string
+	quality   string
+}
+
+// parseYouTubeCommand memeriksa apakah teks adalah command unduh YouTube.
+// Format: "/yt <url> [kualitas]" untuk video, "/ytmp3 <url> [bitrate]" untuk audio.
+func parseYouTubeCommand(text string) (youTubeCommand, bool) {
+	fields := strings.Fields(strings.TrimSpace(text))
+	if len(fields) < 2 {
+		return youTubeCommand{}, false
+	}
+
+	var mediaType, defaultQuality string
+	switch strings.ToLower(fields[0]) {
+	case "/yt", "yt", "!yt":
+		mediaType, defaultQuality = youTubeTypeVideo, youTubeDefaultVideo
+	case "/ytmp3", "ytmp3", "!ytmp3":
+		mediaType, defaultQuality = youTubeTypeAudio, youTubeDefaultAudio
+	default:
+		return youTubeCommand{}, false
+	}
+
+	rawURL := fields[1]
+	if !youtubeRegex.MatchString(rawURL) {
+		return youTubeCommand{}, false
+	}
+
+	quality := defaultQuality
+	if len(fields) > 2 {
+		quality = fields[2]
+	}
+
+	return youTubeCommand{url: rawURL, mediaType: mediaType, quality: quality}, true
+}
+
+// handleYouTube mengunduh video atau audio YouTube lalu mengirimnya ke chat.
+func handleYouTube(client *ClientWrapper, chatJID types.JID, youtubeURL, mediaType, quality string) {
+	log.Printf("[youtube] Menerima permintaan %s %s (kualitas %s)", mediaType, youtubeURL, quality)
+	ctx := context.Background()
+
+	processingMsg := client.SendText(ctx, chatJID, fmt.Sprintf("⏳ *Memproses YouTube…*\n\n🎚 _%s • %s_", mediaType, quality))
+
+	video, err := DownloadYouTube(youtubeURL, mediaType, quality, apiKey)
+	if err != nil {
+		log.Printf("[youtube] ❌ Gagal: %v", err)
+		errText := fmt.Sprintf("❌ Gagal download *YouTube*\n\n%s", err.Error())
+		if processingMsg != nil {
+			client.EditText(ctx, chatJID, processingMsg.ID, errText)
+		} else {
+			client.SendText(ctx, chatJID, errText)
+		}
+		return
+	}
+
+	log.Printf("[youtube] ✓ Ketemu: %s (%s, %s)", video.Title, video.Data.Quality, video.Data.Size)
+
+	summary := fmt.Sprintf("🎬 *%s*\n\n👤 *Channel:* %s\n⏱ *Durasi:* %s\n👁 *Views:* %s\n🎚 *Kualitas:* %s (%s)",
+		video.Title, video.Channel, video.DurationText(), video.Views, video.Data.Quality, video.Data.Size)
+	if video.Data.Quality != quality {
+		summary += fmt.Sprintf("\n⚠️ _%s tidak tersedia, pakai %s_", quality, video.Data.Quality)
+	}
+	summary += fmt.Sprintf("\n\n📥 _Mengirim %s…_", mediaType)
+
+	if processingMsg != nil {
+		client.EditText(ctx, chatJID, processingMsg.ID, summary)
+	} else {
+		client.SendText(ctx, chatJID, summary)
+	}
+
+	if video.Thumbnail != "" {
+		sendImage(client, ctx, chatJID, video.Thumbnail, fmt.Sprintf("🎬 %s", video.Title))
+	}
+
+	data, mimeType, err := downloadFile(video.Data.URL)
+	if err != nil {
+		log.Printf("[youtube] ❌ Gagal download file: %v", err)
+		client.SendText(ctx, chatJID, fmt.Sprintf("❌ Gagal mengunduh file: %v", err))
+		return
+	}
+	log.Printf("[youtube] Download sukses — %.1fMB, upload ke WA...", float64(len(data))/(1024*1024))
+
+	if mediaType == youTubeTypeAudio {
+		uploadAndSendAudio(client, ctx, chatJID, data, "audio/mpeg")
+	} else {
+		uploadAndSendVideo(client, ctx, chatJID, data, mimeType, fmt.Sprintf("🎬 %s", video.Title))
+	}
+	log.Printf("[youtube] ✓ Terkirim!")
+}
+
+// --- Google Drive ---
+
+// handleGDrive mengunduh file Google Drive lalu mengirimnya sebagai dokumen.
+func handleGDrive(client *ClientWrapper, chatJID types.JID, gdriveURL string) {
+	log.Printf("[gdrive] Menerima link %s", gdriveURL)
+	ctx := context.Background()
+
+	if gdriveFolderRegex.MatchString(gdriveURL) {
+		client.SendText(ctx, chatJID, "❌ Link *folder* Google Drive belum didukung — kirim link file-nya ya.")
+		return
+	}
+
+	processingMsg := client.SendText(ctx, chatJID, "⏳ *Memproses Google Drive…*")
+
+	data, fileName, mimeType, err := DownloadGDrive(gdriveURL, apiKey)
+	if err != nil {
+		log.Printf("[gdrive] ❌ Gagal: %v", err)
+		errText := fmt.Sprintf("❌ Gagal download *Google Drive*\n\n%s", err.Error())
+		if processingMsg != nil {
+			client.EditText(ctx, chatJID, processingMsg.ID, errText)
+		} else {
+			client.SendText(ctx, chatJID, errText)
+		}
+		return
+	}
+
+	sizeMB := float64(len(data)) / (1024 * 1024)
+	log.Printf("[gdrive] ✓ %s — %.1fMB (%s)", fileName, sizeMB, mimeType)
+
+	summary := fmt.Sprintf("✅ *File Google Drive*\n\n📄 *Nama:* %s\n💾 *Ukuran:* %.1f MB\n🧩 *Tipe:* %s\n\n📥 _Mengirim file…_",
+		fileName, sizeMB, mimeType)
+	if processingMsg != nil {
+		client.EditText(ctx, chatJID, processingMsg.ID, summary)
+	} else {
+		client.SendText(ctx, chatJID, summary)
+	}
+
+	uploadAndSendDocument(client, ctx, chatJID, data, mimeType, fileName, fmt.Sprintf("📄 %s", fileName))
+	log.Printf("[gdrive] ✓ Terkirim!")
 }
 
 // download memanggil API yang sesuai berdasarkan platform.

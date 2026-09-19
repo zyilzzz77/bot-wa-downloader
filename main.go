@@ -124,9 +124,9 @@ func main() {
 		}
 	})
 
-	fmt.Println("╔══════════════════════════════════════════════╗")
-	fmt.Println("║ BOT WA DOWNLOADER TT, IG, TERABOX & THREADS ║")
-	fmt.Println("╚══════════════════════════════════════════════╝")
+	fmt.Println("╔═════════════════════════════════════════════════════════╗")
+	fmt.Println("║ BOT WA DOWNLOADER YT, TT, IG, GDRIVE, TERABOX & THREADS ║")
+	fmt.Println("╚═════════════════════════════════════════════════════════╝")
 	fmt.Println()
 
 	if waClient.Store.ID == nil {
