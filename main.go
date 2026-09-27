@@ -25,10 +25,18 @@ import (
 
 var apiKey string
 
+// lydevApiKey adalah project API key untuk fitur QRIS (LYDEV Pay).
+var lydevApiKey string
+
 func init() {
 	apiKey = os.Getenv("NEOXR_API_KEY")
 	if apiKey == "" {
 		fmt.Fprintf(os.Stderr, "WARNING: NEOXR_API_KEY tidak diset. Downloader tidak akan berfungsi.\n")
+	}
+
+	lydevApiKey = os.Getenv("LYDEV_API_KEY")
+	if lydevApiKey == "" {
+		fmt.Fprintf(os.Stderr, "WARNING: LYDEV_API_KEY tidak diset. Fitur QRIS tidak akan berfungsi.\n")
 	}
 }
 

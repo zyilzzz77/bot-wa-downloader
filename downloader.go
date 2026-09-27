@@ -41,12 +41,27 @@ type AioResponse struct {
 }
 
 // AioData berisi media dari API aio. Field "photo" bisa berupa array URL
-// atau boolean false, sehingga disimpan mentah dan di-parse terpisah.
+// atau boolean false, sedangkan "video"/"audio" bisa berupa string URL atau
+// boolean false, sehingga disimpan mentah dan di-parse terpisah.
 type AioData struct {
-	Video   string          `json:"video"`
-	VideoWM string          `json:"videoWM"`
-	Audio   string          `json:"audio"`
+	Video   json.RawMessage `json:"video"`
+	VideoWM json.RawMessage `json:"videoWM"`
+	Audio   json.RawMessage `json:"audio"`
 	Photo   json.RawMessage `json:"photo"`
+}
+
+// parseStringField mengekstrak nilai string dari field API yang bisa berupa
+// string URL atau boolean false (mis. "audio": false). Mengembalikan "" jika
+// field kosong atau bukan string.
+func parseStringField(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return ""
+	}
+	return s
 }
 
 // parsePhotoURLs mengekstrak URL foto dari field "photo" API aio.
@@ -102,8 +117,8 @@ type InstagramMedia struct {
 // ThreadsResponse merepresentasikan respons dari API threads.
 // Bentuknya sama dengan Instagram: array {type, url}.
 type ThreadsResponse struct {
-	Creator string          `json:"creator"`
-	Status  bool            `json:"status"`
+	Creator string           `json:"creator"`
+	Status  bool             `json:"status"`
 	Data    []InstagramMedia `json:"data"`
 }
 
@@ -172,6 +187,22 @@ type GDriveResponse struct {
 // GDriveData berisi link unduhan file Google Drive.
 type GDriveData struct {
 	URL string `json:"url"`
+}
+
+// --- Brat (sticker) API response types ---
+
+// BratResponse merepresentasikan respons dari API brat / bratvid.
+type BratResponse struct {
+	Creator string   `json:"creator"`
+	Status  bool     `json:"status"`
+	Message string   `json:"msg"`
+	Data    BratData `json:"data"`
+}
+
+// BratData berisi file gambar (brat) atau video (bratvid) hasil generator.
+type BratData struct {
+	URL  string `json:"url"`
+	Mime string `json:"mime"`
 }
 
 // --- Terabox API response types ---
@@ -338,11 +369,11 @@ func parseAioResponse(body []byte) (*DownloadResult, error) {
 		Platform: "tiktok",
 		Creator:  apiResp.Creator,
 	}
-	if apiResp.Data.Video != "" {
-		result.Videos = append(result.Videos, apiResp.Data.Video)
+	if video := parseStringField(apiResp.Data.Video); video != "" {
+		result.Videos = append(result.Videos, video)
 	}
-	if apiResp.Data.Audio != "" {
-		result.Audio = append(result.Audio, apiResp.Data.Audio)
+	if audio := parseStringField(apiResp.Data.Audio); audio != "" {
+		result.Audio = append(result.Audio, audio)
 	}
 	for _, photo := range parsePhotoURLs(apiResp.Data.Photo) {
 		if photo != "" {
@@ -771,4 +802,44 @@ func DownloadGDrive(gdriveURL, apiKey string) ([]byte, string, string, error) {
 	}
 
 	return data, fileName, mimeType, nil
+}
+
+// --- Brat (sticker) ---
+
+// GenerateBrat meminta generator brat (gambar) atau bratvid (video animasi)
+// dari API neoxr. Mengembalikan URL media beserta MIME-nya.
+func GenerateBrat(text, apiKey string, animated bool) (string, string, error) {
+	endpoint := "brat"
+	if animated {
+		endpoint = "bratvid"
+	}
+
+	apiURL := fmt.Sprintf(
+		"https://api.neoxr.eu/api/%s?text=%s&apikey=%s",
+		endpoint,
+		url.QueryEscape(text),
+		apiKey,
+	)
+
+	body, err := callAPIWithRetry(apiURL, endpoint)
+	if err != nil {
+		return "", "", err
+	}
+
+	var apiResp BratResponse
+	if err := json.Unmarshal(body, &apiResp); err != nil {
+		return "", "", fmt.Errorf("gagal membaca respons API %s: %w", endpoint, err)
+	}
+
+	if !apiResp.Status {
+		if apiResp.Message != "" {
+			return "", "", errors.New(apiResp.Message)
+		}
+		return "", "", fmt.Errorf("API %s mengembalikan status gagal", endpoint)
+	}
+	if apiResp.Data.URL == "" {
+		return "", "", fmt.Errorf("API %s tidak mengembalikan media — coba lagi", endpoint)
+	}
+
+	return apiResp.Data.URL, apiResp.Data.Mime, nil
 }

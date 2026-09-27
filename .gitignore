@@ -1,4 +1,5 @@
 .env
+.commandcode/
 *.log
 data/
 botgodownloader

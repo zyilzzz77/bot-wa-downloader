@@ -5,6 +5,7 @@ services:
     restart: unless-stopped
     environment:
       - NEOXR_API_KEY=${NEOXR_API_KEY}
+      - LYDEV_API_KEY=${LYDEV_API_KEY}
       - TZ=Asia/Jakarta
     volumes:
       - ./data:/app/data
