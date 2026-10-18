@@ -99,13 +99,13 @@ func main() {
 	dbPath := filepath.Join(dataDir, "whatsapp.db")
 
 	// Inisialisasi SQLite store
-	rawDB, err := sql.Open("sqlite", fmt.Sprintf("file:%s?_journal_mode=WAL&_busy_timeout=5000", dbPath))
+	dsn := fmt.Sprintf(
+		"file:%s?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)",
+		dbPath,
+	)
+	rawDB, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Gagal membuka database: %v\n", err)
-		os.Exit(1)
-	}
-	if _, err := rawDB.Exec("PRAGMA foreign_keys = ON"); err != nil {
-		fmt.Fprintf(os.Stderr, "Gagal enable foreign keys: %v\n", err)
 		os.Exit(1)
 	}
 	container := sqlstore.NewWithDB(rawDB, "sqlite", waLog.Stdout("db", "DEBUG", true))
