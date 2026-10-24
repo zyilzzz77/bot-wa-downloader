@@ -139,6 +139,11 @@ func handleMessage(client *ClientWrapper, evt *events.Message) {
 		return
 	}
 
+	if cmd, ok := parseSholatCommand(text); ok {
+		handleSholatCommand(client, evt.Info.Chat, cmd)
+		return
+	}
+
 	platform, detectedURL := detectURL(text)
 	if detectedURL == "" {
 		return

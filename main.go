@@ -163,6 +163,9 @@ func main() {
 		fmt.Println("✓ Bot sudah login dan siap digunakan!")
 	}
 
+	// Jalankan penjadwal pengingat sholat setelah bot tersambung.
+	go sholatMgr.run(wrapper)
+
 	fmt.Println("Tekan Ctrl+C untuk keluar…")
 
 	sigCh := make(chan os.Signal, 1)
