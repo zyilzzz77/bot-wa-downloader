@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"path"
@@ -87,13 +89,15 @@ type tiktokEndpoint struct {
 }
 
 // tiktokEndpoints membuat daftar endpoint TikTok berurutan sesuai prioritas.
+// Endpoint "tiktok" ditaruh pertama karena paling stabil saat ini; endpoint
+// snaptik sering membalas "Content unavailable" untuk video yang sebenarnya ada.
 func tiktokEndpoints(tiktokURL, apiKey string) []tiktokEndpoint {
 	escaped := url.QueryEscape(tiktokURL)
 	return []tiktokEndpoint{
+		{"tiktok", fmt.Sprintf("https://api.neoxr.eu/api/tiktok?url=%s&apikey=%s", escaped, apiKey), true},
+		{"aio", fmt.Sprintf("https://api.neoxr.eu/api/aio?url=%s&apikey=%s", escaped, apiKey), true},
 		{"snaptik-v2", fmt.Sprintf("https://api.neoxr.eu/api/snaptik-v2?url=%s&apikey=%s", escaped, apiKey), false},
 		{"snaptik", fmt.Sprintf("https://api.neoxr.eu/api/snaptik?url=%s&apikey=%s", escaped, apiKey), false},
-		{"aio", fmt.Sprintf("https://api.neoxr.eu/api/aio?url=%s&apikey=%s", escaped, apiKey), true},
-		{"tiktok", fmt.Sprintf("https://api.neoxr.eu/api/tiktok?url=%s&apikey=%s", escaped, apiKey), true},
 	}
 }
 
@@ -103,6 +107,7 @@ func tiktokEndpoints(tiktokURL, apiKey string) []tiktokEndpoint {
 type InstagramResponse struct {
 	Creator string           `json:"creator"`
 	Status  bool             `json:"status"`
+	Message string           `json:"msg"`
 	Data    []InstagramMedia `json:"data"`
 }
 
@@ -119,6 +124,7 @@ type InstagramMedia struct {
 type ThreadsResponse struct {
 	Creator string           `json:"creator"`
 	Status  bool             `json:"status"`
+	Message string           `json:"msg"`
 	Data    []InstagramMedia `json:"data"`
 }
 
@@ -128,6 +134,7 @@ type ThreadsResponse struct {
 type PlayResponse struct {
 	Creator         string   `json:"creator"`
 	Status          bool     `json:"status"`
+	Message         string   `json:"msg"`
 	ID              string   `json:"id"`
 	Title           string   `json:"title"`
 	Thumbnail       string   `json:"thumbnail"`
@@ -211,6 +218,7 @@ type BratData struct {
 type TeraboxResponse struct {
 	Creator string        `json:"creator"`
 	Status  bool          `json:"status"`
+	Message string        `json:"msg"`
 	Data    []TeraboxFile `json:"data"`
 }
 
@@ -245,10 +253,18 @@ var httpClient = &http.Client{Timeout: 120 * time.Second}
 
 // --- Retry wrapper ---
 
-const maxRetries = 3
+const (
+	maxRetries = 3
+	// apiUserAgent dipakai saat memanggil API. User-Agent default Go
+	// ("Go-http-client/1.1") sering ditolak Cloudflare dan dibalas halaman HTML.
+	apiUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+	// maxSnippetLength membatasi panjang body yang ditulis ke log.
+	maxSnippetLength = 200
+)
 
 // callAPIWithRetry memanggil API dengan auto-retry (backoff 2s, 4s, 8s).
-// Retry hanya untuk status 5xx (server error).
+// Retry dilakukan untuk gangguan yang bersifat sementara: status 5xx,
+// 429 (rate limit), dan respons yang bukan JSON (mis. halaman Cloudflare).
 func callAPIWithRetry(apiURL, platform string) ([]byte, error) {
 	var lastErr error
 	for attempt := 0; attempt < maxRetries; attempt++ {
@@ -258,29 +274,170 @@ func callAPIWithRetry(apiURL, platform string) ([]byte, error) {
 			time.Sleep(delay)
 		}
 
-		resp, err := httpClient.Get(apiURL)
-		if err != nil {
-			lastErr = fmt.Errorf("gagal menghubungi API: %w", err)
-			continue
+		body, retryable, err := callAPIOnce(apiURL, platform)
+		if err == nil {
+			return body, nil
 		}
 
-		body, readErr := io.ReadAll(resp.Body)
-		resp.Body.Close()
-
-		if readErr != nil {
-			lastErr = fmt.Errorf("gagal membaca respons API: %w", readErr)
-			continue
+		log.Printf("[%s] %v (retryable=%t)", platform, err, retryable)
+		lastErr = err
+		if !retryable {
+			return nil, err
 		}
-
-		// Status 5xx → server error, retry. Status lain → langsung return.
-		if resp.StatusCode >= 500 {
-			lastErr = fmt.Errorf("API %s error %d: %s", platform, resp.StatusCode, string(body))
-			continue
-		}
-
-		return body, nil
 	}
 	return nil, lastErr
+}
+
+// callAPIOnce menjalankan satu request ke API dan memastikan responsnya JSON.
+// retryable menandai error yang masih mungkin berhasil bila diulang.
+func callAPIOnce(apiURL, platform string) (body []byte, retryable bool, err error) {
+	req, err := http.NewRequest(http.MethodGet, apiURL, nil)
+	if err != nil {
+		return nil, false, fmt.Errorf("gagal menyiapkan request ke API %s", platform)
+	}
+	req.Header.Set("User-Agent", apiUserAgent)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, true, fmt.Errorf("gagal menghubungi server API — %s", networkErrorText(err))
+	}
+	defer resp.Body.Close()
+
+	body, err = io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, true, fmt.Errorf("gagal membaca respons API — koneksi terputus")
+	}
+
+	switch {
+	case resp.StatusCode >= 500:
+		return nil, true, fmt.Errorf("server API sedang bermasalah (HTTP %d) — coba lagi nanti", resp.StatusCode)
+	case resp.StatusCode == http.StatusTooManyRequests:
+		return nil, true, fmt.Errorf("server API sedang membatasi permintaan — coba lagi nanti")
+	case resp.StatusCode == http.StatusUnauthorized, resp.StatusCode == http.StatusForbidden:
+		return nil, false, &fatalAPIError{
+			fmt.Sprintf("server API menolak permintaan (HTTP %d) — periksa API key", resp.StatusCode),
+		}
+	}
+
+	// Cloudflare membalas halaman HTML (status 200) saat situs diblokir atau
+	// sedang gangguan. Body seperti ini tidak mungkin diparse sebagai JSON.
+	if !isJSONBody(body) {
+		log.Printf("[%s] respons bukan JSON — body: %s", platform, snippet(body))
+		return nil, true, fmt.Errorf("server API mengirim halaman web, bukan data — coba lagi nanti")
+	}
+
+	return body, false, nil
+}
+
+// isJSONBody memeriksa apakah body respons berupa objek/array JSON, bukan HTML.
+func isJSONBody(body []byte) bool {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
+		return false
+	}
+	return trimmed[0] == '{' || trimmed[0] == '['
+}
+
+// decodeAPIResponse mem-parse body JSON ke dst. Detail teknis hanya masuk log;
+// pengguna menerima pesan yang bisa dimengerti.
+func decodeAPIResponse(body []byte, platform string, dst any) error {
+	if err := json.Unmarshal(body, dst); err != nil {
+		log.Printf("[%s] respons API tidak bisa diparse: %v — body: %s", platform, err, snippet(body))
+		if !isJSONBody(body) {
+			return fmt.Errorf("server API %s mengirim halaman web, bukan data — coba lagi nanti", platform)
+		}
+		return fmt.Errorf("respons API %s tidak bisa dibaca — coba lagi nanti", platform)
+	}
+	return nil
+}
+
+// snippet memotong body agar log tetap ringkas.
+func snippet(body []byte) string {
+	s := strings.TrimSpace(string(body))
+	if len(s) > maxSnippetLength {
+		return s[:maxSnippetLength] + "…"
+	}
+	return s
+}
+
+// networkErrorText meringkas error jaringan menjadi teks yang enak dibaca.
+func networkErrorText(err error) string {
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "koneksi ke server timeout"
+	}
+
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "no such host"):
+		return "server API tidak bisa dihubungi (DNS gagal)"
+	case strings.Contains(msg, "connection refused"):
+		return "server API menolak koneksi"
+	case strings.Contains(msg, "connection reset"), strings.Contains(msg, "EOF"):
+		return "koneksi ke server terputus"
+	}
+	return "tidak bisa terhubung ke server API"
+}
+
+// apiAuthMessage menerjemahkan pesan masalah API key/kuota. ok bernilai false
+// kalau pesan bukan soal autentikasi.
+func apiAuthMessage(msg string) (text string, ok bool) {
+	lower := strings.ToLower(strings.TrimSpace(msg))
+	switch {
+	case strings.Contains(lower, "apikey"), strings.Contains(lower, "api key"):
+		return "API key tidak valid atau sudah kedaluwarsa — hubungi admin bot.", true
+	case strings.Contains(lower, "limit"):
+		return "Kuota API sudah habis — coba lagi nanti.", true
+	}
+	return "", false
+}
+
+// apiMessageToUser menerjemahkan pesan error API neoxr (Inggris) menjadi pesan
+// yang jelas untuk pengguna. Pesan yang tidak dikenali dikembalikan apa adanya.
+func apiMessageToUser(msg string) string {
+	text := strings.TrimSpace(msg)
+	if text == "" {
+		return ""
+	}
+	if auth, ok := apiAuthMessage(text); ok {
+		return auth
+	}
+
+	lower := strings.ToLower(text)
+	switch {
+	case strings.Contains(lower, "not available"),
+		strings.Contains(lower, "unavailable"),
+		strings.Contains(lower, "private"),
+		strings.Contains(lower, "deleted"),
+		strings.Contains(lower, "not found"):
+		return "Konten tidak tersedia — pastikan link valid, akun publik, dan postingan belum dihapus."
+	}
+
+	return text
+}
+
+// fatalAPIError menandai error yang tidak akan berubah walau endpoint lain
+// atau percobaan ulang dilakukan (mis. API key salah, kuota habis).
+type fatalAPIError struct{ msg string }
+
+func (e *fatalAPIError) Error() string { return e.msg }
+
+// isFatalAPIError melaporkan apakah error termasuk fatal.
+func isFatalAPIError(err error) bool {
+	var fatal *fatalAPIError
+	return errors.As(err, &fatal)
+}
+
+// apiStatusError membentuk error dari respons API berstatus gagal.
+func apiStatusError(msg, fallback string) error {
+	if auth, ok := apiAuthMessage(msg); ok {
+		return &fatalAPIError{auth}
+	}
+	if friendly := apiMessageToUser(msg); friendly != "" {
+		return errors.New(friendly)
+	}
+	return errors.New(fallback)
 }
 
 // DownloadTikTok mengambil data media TikTok melalui API neoxr.
@@ -292,6 +449,10 @@ func DownloadTikTok(tiktokURL, apiKey string) (*DownloadResult, error) {
 		result, err := fetchTikTok(ep)
 		if err != nil {
 			log.Printf("[tiktok] %s gagal: %v — mencoba fallback...", ep.name, err)
+			// API key salah / kuota habis tidak akan berubah di endpoint lain.
+			if isFatalAPIError(err) {
+				return nil, err
+			}
 			lastErr = err
 			continue
 		}
@@ -328,12 +489,13 @@ func fetchTikTok(ep tiktokEndpoint) (*DownloadResult, error) {
 // parseSnaptikResponse mem-parse respons endpoint snaptik-v2 / snaptik.
 func parseSnaptikResponse(body []byte) (*DownloadResult, error) {
 	var apiResp TikTokResponse
-	if err := json.Unmarshal(body, &apiResp); err != nil {
-		return nil, fmt.Errorf("gagal membaca respons API TikTok: %w", err)
+	if err := decodeAPIResponse(body, "TikTok", &apiResp); err != nil {
+		return nil, err
 	}
 
 	if !apiResp.Status {
-		return nil, fmt.Errorf("API TikTok mengembalikan status gagal — %s", apiResp.Message)
+		return nil, apiStatusError(apiResp.Message,
+			"API TikTok menolak permintaan — pastikan link valid dan video publik.")
 	}
 
 	result := &DownloadResult{
@@ -354,15 +516,16 @@ func parseSnaptikResponse(body []byte) (*DownloadResult, error) {
 	return result, nil
 }
 
-// parseAioResponse mem-parse respons endpoint aio.
+// parseAioResponse mem-parse respons endpoint aio / tiktok.
 func parseAioResponse(body []byte) (*DownloadResult, error) {
 	var apiResp AioResponse
-	if err := json.Unmarshal(body, &apiResp); err != nil {
-		return nil, fmt.Errorf("gagal membaca respons API TikTok: %w", err)
+	if err := decodeAPIResponse(body, "TikTok", &apiResp); err != nil {
+		return nil, err
 	}
 
 	if !apiResp.Status {
-		return nil, fmt.Errorf("API TikTok mengembalikan status gagal — %s", apiResp.Message)
+		return nil, apiStatusError(apiResp.Message,
+			"API TikTok menolak permintaan — pastikan link valid dan video publik.")
 	}
 
 	result := &DownloadResult{
@@ -397,12 +560,13 @@ func DownloadInstagram(igURL, apiKey string) (*DownloadResult, error) {
 	}
 
 	var apiResp InstagramResponse
-	if err := json.Unmarshal(body, &apiResp); err != nil {
-		return nil, fmt.Errorf("gagal membaca respons API Instagram: %w", err)
+	if err := decodeAPIResponse(body, "Instagram", &apiResp); err != nil {
+		return nil, err
 	}
 
 	if !apiResp.Status {
-		return nil, fmt.Errorf("API Instagram mengembalikan status gagal — pastikan link valid")
+		return nil, apiStatusError(apiResp.Message,
+			"API Instagram menolak permintaan — pastikan link valid dan akun publik.")
 	}
 
 	result := &DownloadResult{
@@ -463,12 +627,13 @@ func DownloadThreads(threadsURL, apiKey string) (*DownloadResult, error) {
 	}
 
 	var apiResp ThreadsResponse
-	if err := json.Unmarshal(body, &apiResp); err != nil {
-		return nil, fmt.Errorf("gagal membaca respons API Threads: %w", err)
+	if err := decodeAPIResponse(body, "Threads", &apiResp); err != nil {
+		return nil, err
 	}
 
 	if !apiResp.Status {
-		return nil, fmt.Errorf("API Threads mengembalikan status gagal — pastikan link valid")
+		return nil, apiStatusError(apiResp.Message,
+			"API Threads menolak permintaan — pastikan link valid dan akun publik.")
 	}
 
 	result := &DownloadResult{
@@ -517,12 +682,13 @@ func DownloadTerabox(teraboxURL, apiKey string) (*DownloadResult, error) {
 	}
 
 	var apiResp TeraboxResponse
-	if err := json.Unmarshal(body, &apiResp); err != nil {
-		return nil, fmt.Errorf("gagal membaca respons API Terabox: %w", err)
+	if err := decodeAPIResponse(body, "Terabox", &apiResp); err != nil {
+		return nil, err
 	}
 
 	if !apiResp.Status {
-		return nil, fmt.Errorf("API Terabox mengembalikan status gagal — pastikan link valid")
+		return nil, apiStatusError(apiResp.Message,
+			"API Terabox menolak permintaan — pastikan link valid dan bisa diakses publik.")
 	}
 	if len(apiResp.Data) == 0 {
 		return nil, fmt.Errorf("API Terabox tidak mengembalikan file — pastikan link valid")
@@ -582,12 +748,12 @@ func SearchPlay(query, apiKey string) (*PlayResponse, error) {
 	}
 
 	var apiResp PlayResponse
-	if err := json.Unmarshal(body, &apiResp); err != nil {
-		return nil, fmt.Errorf("gagal membaca respons API Play: %w", err)
+	if err := decodeAPIResponse(body, "Play", &apiResp); err != nil {
+		return nil, err
 	}
 
 	if !apiResp.Status {
-		return nil, fmt.Errorf("lagu tidak ditemukan — coba kata kunci lain")
+		return nil, apiStatusError(apiResp.Message, "lagu tidak ditemukan — coba kata kunci lain")
 	}
 	if apiResp.Data.URL == "" {
 		return nil, fmt.Errorf("API Play tidak mengembalikan link audio — coba lagi")
@@ -628,11 +794,16 @@ func youTubeFallbackQualities(mediaType, quality string) []string {
 	return nil
 }
 
+// isQualityMessage mendeteksi pesan API berbentuk "Quality <x> not available".
+func isQualityMessage(msg string) bool {
+	m := strings.ToLower(strings.TrimSpace(msg))
+	return strings.HasPrefix(m, "quality ") && strings.Contains(m, "not available")
+}
+
 // isQualityUnavailable memeriksa apakah error berasal dari pesan API
 // "Quality <x> not available" — bukan error lain seperti link tidak valid.
 func isQualityUnavailable(err error) bool {
-	msg := strings.ToLower(err.Error())
-	return strings.HasPrefix(msg, "quality ") && strings.Contains(msg, "not available")
+	return err != nil && isQualityMessage(err.Error())
 }
 
 // fetchYouTube memanggil API youtube satu kali untuk satu kualitas.
@@ -651,15 +822,18 @@ func fetchYouTube(youtubeURL, mediaType, quality, apiKey string) (*YouTubeRespon
 	}
 
 	var apiResp YouTubeResponse
-	if err := json.Unmarshal(body, &apiResp); err != nil {
-		return nil, fmt.Errorf("gagal membaca respons API YouTube: %w", err)
+	if err := decodeAPIResponse(body, "YouTube", &apiResp); err != nil {
+		return nil, err
 	}
 
 	if !apiResp.Status {
-		if apiResp.Message != "" {
+		// Pesan kualitas dibiarkan apa adanya karena dipakai untuk menentukan
+		// fallback kualitas di DownloadYouTube.
+		if isQualityMessage(apiResp.Message) {
 			return nil, errors.New(apiResp.Message)
 		}
-		return nil, fmt.Errorf("API YouTube mengembalikan status gagal — pastikan link valid")
+		return nil, apiStatusError(apiResp.Message,
+			"API YouTube menolak permintaan — pastikan link valid dan video publik.")
 	}
 	if apiResp.Data.URL == "" {
 		return nil, fmt.Errorf("API YouTube tidak mengembalikan link download — coba lagi")
@@ -681,7 +855,6 @@ func DownloadYouTube(youtubeURL, mediaType, quality, apiKey string) (*YouTubeRes
 		return nil, err
 	}
 
-	requestedErr := err
 	for _, fallback := range youTubeFallbackQualities(mediaType, quality) {
 		log.Printf("[youtube] Kualitas %s tidak tersedia — coba %s...", quality, fallback)
 
@@ -695,7 +868,7 @@ func DownloadYouTube(youtubeURL, mediaType, quality, apiKey string) (*YouTubeRes
 		}
 	}
 
-	return nil, requestedErr
+	return nil, fmt.Errorf("kualitas %s tidak tersedia untuk konten ini — coba kualitas lain", quality)
 }
 
 // --- Google Drive downloader ---
@@ -762,15 +935,13 @@ func DownloadGDrive(gdriveURL, apiKey string) ([]byte, string, string, error) {
 	}
 
 	var apiResp GDriveResponse
-	if err := json.Unmarshal(body, &apiResp); err != nil {
-		return nil, "", "", fmt.Errorf("gagal membaca respons API Google Drive: %w", err)
+	if err := decodeAPIResponse(body, "Google Drive", &apiResp); err != nil {
+		return nil, "", "", err
 	}
 
 	if !apiResp.Status {
-		if apiResp.Message != "" {
-			return nil, "", "", errors.New(apiResp.Message)
-		}
-		return nil, "", "", fmt.Errorf("API Google Drive mengembalikan status gagal — pastikan link valid")
+		return nil, "", "", apiStatusError(apiResp.Message,
+			"API Google Drive menolak permintaan — pastikan link valid dan file bisa diakses publik.")
 	}
 	if apiResp.Data.URL == "" {
 		return nil, "", "", fmt.Errorf("API Google Drive tidak mengembalikan link download — coba lagi")
@@ -827,15 +998,13 @@ func GenerateBrat(text, apiKey string, animated bool) (string, string, error) {
 	}
 
 	var apiResp BratResponse
-	if err := json.Unmarshal(body, &apiResp); err != nil {
-		return "", "", fmt.Errorf("gagal membaca respons API %s: %w", endpoint, err)
+	if err := decodeAPIResponse(body, endpoint, &apiResp); err != nil {
+		return "", "", err
 	}
 
 	if !apiResp.Status {
-		if apiResp.Message != "" {
-			return "", "", errors.New(apiResp.Message)
-		}
-		return "", "", fmt.Errorf("API %s mengembalikan status gagal", endpoint)
+		return "", "", apiStatusError(apiResp.Message,
+			fmt.Sprintf("API %s menolak permintaan — coba lagi nanti.", endpoint))
 	}
 	if apiResp.Data.URL == "" {
 		return "", "", fmt.Errorf("API %s tidak mengembalikan media — coba lagi", endpoint)

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -75,12 +74,18 @@ func FetchSholat(city, apiKey string) (*sholatSchedule, error) {
 	}
 
 	var apiResp sholatResponse
-	if err := json.Unmarshal(body, &apiResp); err != nil {
-		return nil, fmt.Errorf("gagal membaca respons API sholat: %w", err)
+	if err := decodeAPIResponse(body, "sholat", &apiResp); err != nil {
+		return nil, err
 	}
 
 	if !apiResp.Status {
 		msg := apiResp.Message
+		if auth, ok := apiAuthMessage(msg); ok {
+			msg = auth
+		} else if strings.Contains(strings.ToLower(msg), "region") ||
+			strings.Contains(strings.ToLower(msg), "not found") {
+			msg = "Kota tidak dikenali"
+		}
 		if msg == "" {
 			msg = "kota tidak dikenali"
 		}

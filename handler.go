@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
@@ -822,11 +823,21 @@ const (
 // kecil/cepat tidak menambah pesan. Progres tetap di-update saat koneksi
 // tersendat, sehingga estimasi ikut menyesuaikan.
 func downloadFileWithProgress(client *ClientWrapper, ctx context.Context, chatJID types.JID, rawURL, label string) ([]byte, string, error) {
-	resp, err := httpClient.Get(rawURL)
+	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
 	if err != nil {
-		return nil, "", fmt.Errorf("gagal mengunduh: %w", err)
+		return nil, "", fmt.Errorf("link unduhan tidak valid")
+	}
+	req.Header.Set("User-Agent", apiUserAgent)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("gagal mengunduh: %s", networkErrorText(err))
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return nil, "", fmt.Errorf("server media menolak unduhan (HTTP %d) — coba lagi nanti", resp.StatusCode)
+	}
 
 	mimeType := resp.Header.Get("Content-Type")
 	if mimeType == "" {
