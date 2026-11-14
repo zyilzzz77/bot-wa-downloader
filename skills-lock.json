@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "skills": {
+    "context-dev": {
+      "source": "docs.context.dev",
+      "sourceUrl": "https://docs.context.dev",
+      "sourceType": "well-known",
+      "computedHash": "7d8bb428610ace832ea7ea1fbb20ebb6beede0a5945adaf2999de390a4ad5729",
+      "wellKnownDigest": "sha256:93495d58a9e805b639fc628bbf0008f32805e244697642450c83d51a80f87a2b"
+    }
+  }
+}
